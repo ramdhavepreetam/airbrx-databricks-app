@@ -1,6 +1,6 @@
 """
-Airbrx analysis job — self-contained, no relative imports.
-Runs as the app service principal inside a Databricks serverless Python task.
+Airbrx analysis job — uses Databricks Statement Execution API (SQL warehouse).
+No PySpark/PyArrow dependency. Runs as a Python serverless task.
 
 Modes:
   --mode ingest     Hourly: pull new query_history rows → fingerprint_history
@@ -16,28 +16,33 @@ import os
 import re
 import time
 from datetime import datetime, timezone, timedelta
-from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.types import StringType, MapType
+
+import requests
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.sql import StatementState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-CATALOG      = os.environ.get("AIRBRX_STATE_CATALOG", "airbrx_app")
-SCHEMA       = os.environ.get("AIRBRX_STATE_SCHEMA",  "state")
-BILLING_VIEW = os.environ.get("AIRBRX_BILLING_VIEW",  "airbrx_app.state.billing_usage_v")
-DBU_RATE_USD = float(os.environ.get("DBU_RATE_USD",   "0.70"))
+CATALOG       = os.environ.get("AIRBRX_STATE_CATALOG",  "airbrx_app")
+SCHEMA        = os.environ.get("AIRBRX_STATE_SCHEMA",   "state")
+WAREHOUSE_ID  = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
+BILLING_VIEW  = os.environ.get("AIRBRX_BILLING_VIEW",   "airbrx_app.state.billing_usage_v")
+DBU_RATE_USD  = float(os.environ.get("DBU_RATE_USD",     "0.70"))
 LOOKBACK_DAYS = 30
+INSERT_BATCH  = 500  # rows per VALUES batch
 
 # ---------------------------------------------------------------------------
-# Inlined fingerprint (§6c) — SHARED CONTRACT with the gateway
+# Inlined fingerprint — SHARED CONTRACT with the gateway (§6c)
 # ---------------------------------------------------------------------------
 _FP_VERSION   = 1
-_TRUNCATE_LEN = 16
-_BLOCK_CMT  = re.compile(r"/\*.*?\*/", re.DOTALL)
-_LINE_CMT   = re.compile(r"--[^\n]*")
-_WHITESPACE = re.compile(r"\s+")
-_STR_LIT    = re.compile(r"'(?:[^'\\]|\\.)*'")
-_NUM_LIT    = re.compile(r"\b\d+(?:\.\d+)?\b")
+_BLOCK_CMT    = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_CMT     = re.compile(r"--[^\n]*")
+_WHITESPACE   = re.compile(r"\s+")
+_STR_LIT      = re.compile(r"'(?:[^'\\]|\\.)*'")
+_NUM_LIT      = re.compile(r"\b\d+(?:\.\d+)?\b")
+_ABX          = re.compile(r"^/\*\s*abx\s+(?P<kv>[^*]+)\*/", re.DOTALL)
+
 
 def _normalize(sql: str) -> str:
     sql = _BLOCK_CMT.sub("", sql)
@@ -48,16 +53,13 @@ def _normalize(sql: str) -> str:
     sql = _NUM_LIT.sub("?", sql)
     return sql
 
+
 def fingerprint(sql: str) -> str:
     digest = hashlib.sha256(_normalize(sql).encode("utf-8")).digest()
-    return base64.b32encode(digest).decode("ascii").lower()[:_TRUNCATE_LEN]
+    return base64.b32encode(digest).decode("ascii").lower()[:16]
 
-# ---------------------------------------------------------------------------
-# Inlined tag parser (§6b)
-# ---------------------------------------------------------------------------
-_ABX = re.compile(r"^/\*\s*abx\s+(?P<kv>[^*]+)\*/", re.DOTALL)
 
-def parse_tag(sql: str):
+def parse_tag(sql: str) -> dict | None:
     m = _ABX.match(sql.lstrip())
     if not m:
         return None
@@ -66,134 +68,178 @@ def parse_tag(sql: str):
     except ValueError:
         return None
 
+
 # ---------------------------------------------------------------------------
-# Spark session — use the active session provided by Databricks
+# SQL execution helper
 # ---------------------------------------------------------------------------
-def get_spark() -> SparkSession:
-    session = SparkSession.getActiveSession()
-    if session:
-        return session
-    return SparkSession.builder.getOrCreate()
+def _get_client() -> WorkspaceClient:
+    return WorkspaceClient()
+
+
+def run_sql(w: WorkspaceClient, sql: str, timeout: str = "50s") -> list[list]:
+    """Execute SQL, poll until done, return rows (or [])."""
+    resp = w.statement_execution.execute_statement(
+        warehouse_id=WAREHOUSE_ID,
+        statement=sql.strip(),
+        wait_timeout=timeout,
+    )
+    for _ in range(120):
+        if resp.status.state in (
+            StatementState.SUCCEEDED, StatementState.FAILED,
+            StatementState.CANCELED, StatementState.CLOSED,
+        ):
+            break
+        time.sleep(2)
+        resp = w.statement_execution.get_statement(resp.statement_id)
+
+    if resp.status.state != StatementState.SUCCEEDED:
+        raise RuntimeError(
+            f"SQL failed ({resp.status.state}): {resp.status.error}\n---\n{sql[:400]}"
+        )
+    return resp.result.data_array or [] if resp.result else []
+
+
+def exec_sql(w: WorkspaceClient, sql: str) -> None:
+    run_sql(w, sql)
+
 
 # ---------------------------------------------------------------------------
 # Hourly ingest
 # ---------------------------------------------------------------------------
-def _get_checkpoint(spark) -> datetime:
+def _get_checkpoint(w: WorkspaceClient) -> datetime:
     try:
-        row = spark.sql(
-            f"SELECT MAX(start_time) AS last FROM {CATALOG}.{SCHEMA}.fingerprint_history"
-        ).first()
-        if row and row["last"]:
-            return row["last"]
+        rows = run_sql(w, f"SELECT MAX(start_time) FROM {CATALOG}.{SCHEMA}.fingerprint_history")
+        val  = rows[0][0] if rows and rows[0][0] else None
+        if val:
+            return datetime.fromisoformat(str(val).replace("Z", "+00:00"))
     except Exception:
         pass
     return datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
 
-@F.udf(returnType=StringType())
-def _fingerprint_udf(sql: str) -> str:
-    if not sql:
-        return None
-    return fingerprint(sql)
 
+def run_ingest(w: WorkspaceClient) -> None:
+    checkpoint     = _get_checkpoint(w)
+    checkpoint_str = checkpoint.strftime("%Y-%m-%d %H:%M:%S")
+    logger.info("Ingest checkpoint: %s", checkpoint_str)
 
-@F.udf(returnType=MapType(StringType(), StringType()))
-def _parse_tag_udf(sql: str):
-    if not sql:
-        return {}
-    result = parse_tag(sql)
-    return result if result else {}
-
-
-def run_ingest(spark) -> None:
-    checkpoint = _get_checkpoint(spark)
-    logger.info("Ingest checkpoint: %s", checkpoint.isoformat())
-
-    new_count = spark.sql(f"""
-        SELECT COUNT(*) AS n FROM {CATALOG}.{SCHEMA}.query_history_v
-        WHERE CAST(start_time AS TIMESTAMP) > '{checkpoint.strftime("%Y-%m-%d %H:%M:%S")}'
+    rows = run_sql(w, f"""
+        SELECT statement_id, warehouse_id, total_duration_ms,
+               CAST(start_time AS TIMESTAMP) AS start_time,
+               statement_text
+        FROM {CATALOG}.{SCHEMA}.query_history_v
+        WHERE CAST(start_time AS TIMESTAMP) > '{checkpoint_str}'
           AND execution_status = 'FINISHED'
-    """).first()["n"]
+        ORDER BY start_time
+    """, timeout="120s")
 
-    logger.info("New rows to ingest: %d", new_count)
-    if not new_count:
+    logger.info("Fetched %d new rows", len(rows))
+    if not rows:
         return
 
-    # Process entirely in Spark — statement_text never moves to the driver.
-    # Fingerprinting and tag parsing run as UDFs on executors.
-    (
-        spark.sql(f"""
-            SELECT statement_id, warehouse_id, total_duration_ms,
-                   CAST(start_time AS TIMESTAMP) AS start_time,
-                   statement_text
-            FROM {CATALOG}.{SCHEMA}.query_history_v
-            WHERE CAST(start_time AS TIMESTAMP) > '{checkpoint.strftime("%Y-%m-%d %H:%M:%S")}'
-              AND execution_status = 'FINISHED'
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    records = []
+    for r in rows:
+        stmt       = r[4] or ""
+        tag        = parse_tag(stmt)
+        ck         = fingerprint(stmt)
+        start_raw  = str(r[3]).split(".")[0] if r[3] else None
+        d          = start_raw[:10] if start_raw else None
+        records.append((
+            ck,
+            str(r[0]).replace("'", "''"),   # statement_id
+            d,
+            start_raw,
+            str(r[1]).replace("'", "''") if r[1] else None,  # warehouse_id
+            r[2],                           # total_duration_ms
+            tag.get("route") if tag else None,
+            tag.get("rule")  if tag else None,
+            now,
+        ))
+
+    # Bulk-insert in batches to avoid statement size limits
+    inserted = 0
+    for i in range(0, len(records), INSERT_BATCH):
+        batch  = records[i : i + INSERT_BATCH]
+        values = ",\n".join(
+            f"('{ck}', '{sid}', '{d}', '{st}', "
+            f"{'NULL' if wh is None else repr(wh)}, "
+            f"{'NULL' if ms is None else int(ms)}, "
+            f"{'NULL' if route is None else repr(route)}, "
+            f"{'NULL' if rule is None else repr(rule)}, "
+            f"'{ing}')"
+            for ck, sid, d, st, wh, ms, route, rule, ing in batch
+        )
+        exec_sql(w, f"""
+            INSERT INTO {CATALOG}.{SCHEMA}.fingerprint_history
+              (ck, statement_id, d, start_time, warehouse_id,
+               total_duration_ms, route, rule_id, ingested_at)
+            VALUES {values}
         """)
-        .withColumn("ck",      _fingerprint_udf("statement_text"))
-        .withColumn("_tag",    _parse_tag_udf("statement_text"))
-        .withColumn("route",   F.col("_tag")["route"])
-        .withColumn("rule_id", F.col("_tag")["rule"])
-        .withColumn("d",       F.to_date("start_time"))
-        .withColumn("ingested_at", F.current_timestamp())
-        .drop("_tag", "statement_text")
-        .write.mode("append")
-        .partitionBy("d")
-        .saveAsTable(f"{CATALOG}.{SCHEMA}.fingerprint_history")
-    )
-    logger.info("Wrote %d rows to fingerprint_history", new_count)
+        inserted += len(batch)
+        logger.info("Inserted batch %d/%d (%d rows)", i // INSERT_BATCH + 1,
+                    -(-len(records) // INSERT_BATCH), len(batch))
+
+    logger.info("Ingest complete — %d rows total", inserted)
+
 
 # ---------------------------------------------------------------------------
 # Daily recompute
 # ---------------------------------------------------------------------------
-def run_recompute(spark) -> None:
+def run_recompute(w: WorkspaceClient) -> None:
     logger.info("Recompute started")
-    _recompute_waterfall(spark)
-    _recompute_coverage(spark)
-    _recompute_rule_effectiveness(spark)
+    _recompute_waterfall(w)
+    _recompute_coverage(w)
+    _recompute_rule_effectiveness(w)
     logger.info("Recompute complete")
 
-def _recompute_waterfall(spark) -> None:
-    df = spark.sql(f"""
+
+def _recompute_waterfall(w: WorkspaceClient) -> None:
+    exec_sql(w, f"""
+        INSERT OVERWRITE {CATALOG}.{SCHEMA}.waterfall_daily
         SELECT
-          CAST(usage_date AS DATE)                        AS d,
+          CAST(usage_date AS DATE)                                    AS d,
           sku_name,
-          usage_metadata.warehouse_id                     AS warehouse_id,
-          SUM(CAST(usage_quantity AS DOUBLE))             AS dbus,
-          SUM(CAST(usage_quantity AS DOUBLE)) * {DBU_RATE_USD} AS usd
+          usage_metadata.warehouse_id                                 AS warehouse_id,
+          SUM(CAST(usage_quantity AS DOUBLE))                         AS dbus,
+          SUM(CAST(usage_quantity AS DOUBLE)) * {DBU_RATE_USD}        AS usd,
+          'raw'                                                       AS layer,
+          current_timestamp()                                         AS updated_at
         FROM {BILLING_VIEW}
         WHERE CAST(usage_date AS DATE) >= date_sub(current_date(), {LOOKBACK_DAYS})
           AND usage_metadata.warehouse_id IS NOT NULL
-        GROUP BY 1, 2, 3
-    """).withColumn("layer", F.lit("raw")).withColumn("updated_at", F.current_timestamp())
-    df.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.waterfall_daily")
+        GROUP BY ALL
+    """)
     logger.info("waterfall_daily updated")
 
-def _recompute_coverage(spark) -> None:
-    df = spark.sql(f"""
+
+def _recompute_coverage(w: WorkspaceClient) -> None:
+    exec_sql(w, f"""
+        INSERT OVERWRITE {CATALOG}.{SCHEMA}.coverage_daily
         SELECT
-          CAST(date(start_time) AS DATE)                                    AS d,
-          COUNT_IF(statement_text LIKE '/* abx %')                          AS gateway_routed,
-          COUNT(*)                                                          AS total,
-          COUNT_IF(statement_text LIKE '/* abx %') * 1.0 / COUNT(*)        AS coverage_ratio
+          CAST(date(start_time) AS DATE)                              AS d,
+          COUNT_IF(statement_text LIKE '/* abx %')                   AS gateway_routed,
+          COUNT(*)                                                    AS total,
+          COUNT_IF(statement_text LIKE '/* abx %') * 1.0 / COUNT(*)  AS coverage_ratio,
+          current_timestamp()                                         AS updated_at
         FROM {CATALOG}.{SCHEMA}.query_history_v
         WHERE start_time >= date_sub(current_date(), {LOOKBACK_DAYS})
-        GROUP BY 1
-        ORDER BY 1
-    """).withColumn("updated_at", F.current_timestamp())
-    df.write.mode("overwrite") \
-      .option("replaceWhere", f"d >= date_sub(current_date(), {LOOKBACK_DAYS})") \
-      .saveAsTable(f"{CATALOG}.{SCHEMA}.coverage_daily")
+        GROUP BY ALL
+        ORDER BY d
+    """)
     logger.info("coverage_daily updated")
 
-def _recompute_rule_effectiveness(spark) -> None:
-    spark.sql(f"""
+
+def _recompute_rule_effectiveness(w: WorkspaceClient) -> None:
+    exec_sql(w, f"""
+        INSERT OVERWRITE {CATALOG}.{SCHEMA}.rule_effectiveness
         WITH attributed AS (
           SELECT fh.ck,
-                 COUNT(*)                                                         AS execs,
+                 COUNT(*)                                                          AS execs,
                  SUM(wc.wh_usd * (fh.total_duration_ms / NULLIF(wd.tot_ms, 0))) AS attributed_usd
           FROM {CATALOG}.{SCHEMA}.fingerprint_history fh
           JOIN (
-            SELECT d, warehouse_id, SUM(CAST(usage_quantity AS DOUBLE)) * {DBU_RATE_USD} AS wh_usd
+            SELECT d, usage_metadata.warehouse_id AS warehouse_id,
+                   SUM(CAST(usage_quantity AS DOUBLE)) * {DBU_RATE_USD} AS wh_usd
             FROM {BILLING_VIEW}
             WHERE CAST(usage_date AS DATE) >= date_sub(current_date(), {LOOKBACK_DAYS})
               AND usage_metadata.warehouse_id IS NOT NULL
@@ -220,85 +266,116 @@ def _recompute_rule_effectiveness(spark) -> None:
           WHERE d >= date_sub(current_date(), 30)
           GROUP BY ck
         )
-        INSERT OVERWRITE {CATALOG}.{SCHEMA}.rule_effectiveness
         SELECT
           b.ck,
           b.rule_id,
           CONCAT(DATE_FORMAT(date_sub(current_date(), 30), 'yyyy-MM-dd'), '/',
-                 DATE_FORMAT(current_date(), 'yyyy-MM-dd'))                          AS window,
+                 DATE_FORMAT(current_date(), 'yyyy-MM-dd'))           AS window,
           b.baseline_rate,
           c.observed,
-          GREATEST(0, CAST(b.baseline_rate * 30 - c.observed AS BIGINT))            AS avoided,
+          GREATEST(0, CAST(b.baseline_rate * 30 - c.observed AS BIGINT)) AS avoided,
           GREATEST(0.0, b.baseline_rate * 30 - c.observed)
-            * COALESCE(a.attributed_usd / NULLIF(a.execs, 0), 0.0)                  AS realized_usd,
-          current_timestamp()                                                        AS updated_at
+            * COALESCE(a.attributed_usd / NULLIF(a.execs, 0), 0.0)   AS realized_usd,
+          current_timestamp()                                         AS updated_at
         FROM baseline b
         JOIN current_window c USING (ck)
         LEFT JOIN attributed a USING (ck)
     """)
     logger.info("rule_effectiveness updated")
 
+
 # ---------------------------------------------------------------------------
 # API sync
 # ---------------------------------------------------------------------------
-def run_sync(spark) -> None:
+def run_sync(w: WorkspaceClient) -> None:
     logger.info("API sync started")
+    ts     = datetime.now(timezone.utc)
+    status = "ok"
+    payload_bytes = 0
     try:
-        import requests
-        from databricks.sdk import WorkspaceClient
-        wc = WorkspaceClient()
-        scope  = os.environ.get("AIRBRX_SECRET_SCOPE", "airbrx-secrets")
-        key    = os.environ.get("AIRBRX_SECRET_KEY",   "api-key")
-        encoded = wc.secrets.get_secret(scope=scope, key=key).value
+        scope   = os.environ.get("AIRBRX_SECRET_SCOPE", "airbrx-secrets")
+        key     = os.environ.get("AIRBRX_SECRET_KEY",   "api-key")
+        encoded = w.secrets.get_secret(scope=scope, key=key).value
         api_key = base64.b64decode(encoded).decode("utf-8")
 
         base_url = os.environ.get("AIRBRX_API_URL", "https://api.airbrx.ai").rstrip("/")
-        headers  = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-                    "X-Client": "databricks-app-v1"}
+        headers  = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+            "X-Client":      "databricks-app-v1",
+        }
 
+        # Pull rules → upsert into rules table
         rules_resp = requests.get(f"{base_url}/v1/rules", headers=headers, timeout=15)
         rules_resp.raise_for_status()
-        logger.info("Pulled %d rules", len(rules_resp.json().get("rules", [])))
+        rules = rules_resp.json().get("rules", [])
+        logger.info("Pulled %d rules", len(rules))
+        if rules:
+            values = ", ".join(
+                f"('{r['rule_id']}', '{r.get('rule_type','')}', "
+                f"'{str(r.get('description','')).replace(chr(39), chr(39)+chr(39))}', "
+                f"'{str(r).replace(chr(39), chr(39)+chr(39))}', current_timestamp())"
+                for r in rules
+            )
+            exec_sql(w, f"""
+                MERGE INTO {CATALOG}.{SCHEMA}.rules AS target
+                USING (SELECT * FROM VALUES {values}
+                       AS t(rule_id, rule_type, description, config_json, pulled_at))
+                  AS source ON target.rule_id = source.rule_id
+                WHEN MATCHED     THEN UPDATE SET *
+                WHEN NOT MATCHED THEN INSERT *
+            """)
 
-        eff_rows = [
-            row.asDict()
-            for row in spark.sql(f"""
-                SELECT rule_id, ck, window, avoided, realized_usd
-                FROM {CATALOG}.{SCHEMA}.rule_effectiveness
-                WHERE window = (SELECT MAX(window) FROM {CATALOG}.{SCHEMA}.rule_effectiveness)
-            """).collect()
-        ]
-        payload = {"reported_at": datetime.now(timezone.utc).isoformat(), "effectiveness": eff_rows}
-        push_resp = requests.post(f"{base_url}/v1/effectiveness", json=payload,
-                                  headers=headers, timeout=15)
+        # Push effectiveness aggregates
+        eff_rows = run_sql(w, f"""
+            SELECT rule_id, ck, window, avoided, realized_usd
+            FROM {CATALOG}.{SCHEMA}.rule_effectiveness
+            WHERE window = (SELECT MAX(window) FROM {CATALOG}.{SCHEMA}.rule_effectiveness)
+        """)
+        payload = {
+            "reported_at":    ts.isoformat(),
+            "effectiveness":  [
+                {"rule_id": r[0], "ck": r[1], "window": r[2],
+                 "avoided": r[3], "realized_usd": r[4]}
+                for r in eff_rows
+            ],
+        }
+        push_resp = requests.post(f"{base_url}/v1/effectiveness",
+                                  json=payload, headers=headers, timeout=15)
         push_resp.raise_for_status()
+        payload_bytes = len(str(payload).encode())
         logger.info("Pushed %d effectiveness rows", len(eff_rows))
 
-        import pandas as pd
-        spark.createDataFrame(pd.DataFrame([{
-            "d": datetime.now(timezone.utc).date(),
-            "ts": datetime.now(timezone.utc),
-            "direction": "push_pull",
-            "payload_bytes": len(str(eff_rows).encode()),
-            "status": "ok",
-        }])).write.mode("append").saveAsTable(f"{CATALOG}.{SCHEMA}.sync_log")
     except Exception as exc:
+        status = f"error: {exc}"
         logger.exception("Sync failed: %s", exc)
+
+    d_str = ts.date().isoformat()
+    ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+    exec_sql(w, f"""
+        INSERT INTO {CATALOG}.{SCHEMA}.sync_log
+          (d, ts, direction, payload_bytes, status)
+        VALUES ('{d_str}', '{ts_str}', 'push_pull', {payload_bytes}, '{status}')
+    """)
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["ingest", "recompute", "sync", "all"], default="all")
+    parser.add_argument("--mode", choices=["ingest", "recompute", "sync", "all"],
+                        default="all")
     args = parser.parse_args()
-    spark = get_spark()
-    if args.mode in ("ingest", "all"):
-        run_ingest(spark)
-    if args.mode in ("recompute", "all"):
-        run_recompute(spark)
-    if args.mode in ("sync", "all"):
-        run_sync(spark)
+
+    if not WAREHOUSE_ID:
+        raise SystemExit("DATABRICKS_WAREHOUSE_ID env var is required")
+
+    w = _get_client()
+    if args.mode in ("ingest",    "all"): run_ingest(w)
+    if args.mode in ("recompute", "all"): run_recompute(w)
+    if args.mode in ("sync",      "all"): run_sync(w)
+
 
 if __name__ == "__main__":
     main()
