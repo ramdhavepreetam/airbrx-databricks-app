@@ -74,7 +74,7 @@ databricks jobs run-now --job-id <job-id>
 ### 8. Redeploy the app after any code change
 ```bash
 databricks apps deploy airbrx-app \
-  --source-code-path "/Workspace/Users/ramdhavepreetam@gmail.com/airbrx-databricks-app" \
+  --source-code-path "/Workspace/Users/<your-email>/airbrx-databricks-app" \
   --no-wait
 ```
 

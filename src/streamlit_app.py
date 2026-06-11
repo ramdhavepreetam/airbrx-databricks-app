@@ -12,7 +12,7 @@ from databricks.sdk.service.sql import StatementState
 
 CATALOG = os.environ.get("AIRBRX_STATE_CATALOG", "airbrx_app")
 SCHEMA  = os.environ.get("AIRBRX_STATE_SCHEMA",  "state")
-WH_ID   = os.environ.get("DATABRICKS_WAREHOUSE_ID", "771ee5c628aafe42")
+WH_ID   = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 
 st.set_page_config(page_title="Airbrx — Cost Intelligence", layout="wide")
 
