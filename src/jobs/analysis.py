@@ -10,8 +10,12 @@ Modes:
 import argparse
 import logging
 import os
-from datetime import datetime, timezone, timedelta
+import sys
 
+# Add src/ to path so sibling lib/ package is importable when job runs from src/jobs/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from datetime import datetime, timezone, timedelta
 from pyspark.sql import SparkSession, functions as F
 
 from lib.fingerprint import fingerprint
@@ -30,6 +34,11 @@ LOOKBACK_DAYS = 30
 
 
 def get_spark() -> SparkSession:
+    # Inside a Databricks job the session already exists — get it directly.
+    # Fall back to DatabricksSession for local dev only.
+    session = SparkSession.getActiveSession()
+    if session:
+        return session
     try:
         from databricks.connect import DatabricksSession
         return DatabricksSession.builder.getOrCreate()
