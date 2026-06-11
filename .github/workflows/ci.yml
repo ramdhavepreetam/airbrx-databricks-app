@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install pytest
+          # Install pure-Python deps only (pyspark/databricks-sdk are Databricks-runtime deps)
+          pip install pandas requests
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  bundle-validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: Validate Asset Bundle
+        run: databricks bundle validate
+        # Validates databricks.yml schema without deploying.
+        # Requires DATABRICKS_HOST + DATABRICKS_TOKEN secrets in repo settings,
+        # or set up with 'databricks auth login' in a self-hosted runner.
+        env:
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        continue-on-error: true  # remove once secrets are configured

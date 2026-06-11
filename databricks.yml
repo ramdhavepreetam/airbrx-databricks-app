@@ -1,0 +1,107 @@
+# Databricks Asset Bundle — Airbrx Cost Intelligence App
+# Deploy:  databricks bundle deploy --target prod
+# Destroy: databricks bundle destroy --target prod
+# Docs:    https://docs.databricks.com/dev-tools/bundles/
+
+bundle:
+  name: airbrx-databricks-app
+
+variables:
+  warehouse_id:
+    description: "SQL Warehouse ID (run 'databricks warehouses list' to find it)"
+  catalog:
+    description: "Unity Catalog catalog name for app state"
+    default: airbrx_app
+  schema:
+    description: "Schema name for app state"
+    default: state
+  airbrx_api_url:
+    description: "Airbrx cloud API endpoint"
+    default: https://api.airbrx.ai
+  secret_scope:
+    description: "Databricks secret scope holding the Airbrx API key"
+    default: airbrx-secrets
+  secret_key:
+    description: "Secret key name within the scope"
+    default: api-key
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://dbc-54d3c7a5-e656.cloud.databricks.com
+
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-54d3c7a5-e656.cloud.databricks.com
+
+resources:
+  # ---------------------------------------------------------------------------
+  # Streamlit App
+  # ---------------------------------------------------------------------------
+  apps:
+    airbrx-app:
+      name: airbrx-app
+      description: >
+        Reads cost and query-history system tables in place and produces an
+        Airbrx cost-optimization report. No query text or usage rows leave the
+        workspace — only aggregate rule-effectiveness stats cross to api.airbrx.ai.
+      source_code_path: .
+
+  # ---------------------------------------------------------------------------
+  # Analysis Job (hourly ingest + daily recompute + API sync)
+  # ---------------------------------------------------------------------------
+  jobs:
+    airbrx-analysis:
+      name: airbrx-analysis
+      description: "Airbrx cost-optimization analysis — hourly ingest + daily recompute"
+
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"
+            dependencies:
+              - databricks-sdk>=0.28.0
+              - requests>=2.31.0
+              - pandas>=2.0.0
+
+      tasks:
+        - task_key: ingest
+          description: "Pull new query_history rows → fingerprint_history"
+          spark_python_task:
+            python_file: src/jobs/analysis.py
+            parameters:
+              - "--mode"
+              - "ingest"
+          environment_key: default
+
+        - task_key: recompute
+          description: "Rebuild waterfall_daily, coverage_daily, rule_effectiveness"
+          depends_on:
+            - task_key: ingest
+          spark_python_task:
+            python_file: src/jobs/analysis.py
+            parameters:
+              - "--mode"
+              - "recompute"
+          environment_key: default
+
+        - task_key: sync
+          description: "Pull rules from api.airbrx.ai; push aggregate effectiveness"
+          depends_on:
+            - task_key: recompute
+          spark_python_task:
+            python_file: src/jobs/analysis.py
+            parameters:
+              - "--mode"
+              - "sync"
+          environment_key: default
+
+      trigger:
+        periodic:
+          interval: 1
+          unit: HOURS
+
+      # Non-secret env vars; the API key is read from the secret scope at runtime
+      job_clusters: []

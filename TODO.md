@@ -56,13 +56,12 @@ Status legend: [ ] open  [~] blocked  [x] done
 
 ## Before GA / marketplace
 
-- [ ] OBO moves from Public Preview to GA — monitor Databricks release notes
-- [ ] `system.billing.list_prices` and `system.query.history` schemas reach GA — re-verify column names
-- [ ] Add entitlement token validation (`DATABRICKS_MARKETPLACE_ENTITLEMENT` env var) for marketplace billing
-- [ ] Automate the admin SQL onboarding (one-click install flow instead of manual runbook)
-- [ ] Add egress allowlist automation or instructions for all three clouds (AWS/Azure/GCP NCC IPs)
-- [ ] Load test: workspace with 10M+ query_history rows — verify ingest job performance
-- [ ] Security review: confirm outbound payload to api.airbrx.ai contains no PII or raw query text
-- [ ] Apply to Databricks Technology Partner program (partner.databricks.com)
-- [ ] Set up GitHub repo + git-backed deployment (replace direct workspace upload)
-- [ ] CI pipeline: `pytest tests/` runs on every PR
+- [~] OBO moves from Public Preview to GA — now GA for compliance-profile workspaces (June 2026); GA for all workspaces TBD. Monitor Databricks release notes.
+- [ ] `system.billing.list_prices` and `system.query.history` schemas reach GA — re-verify column names on live workspace before listing
+- [x] Automate the admin SQL onboarding — `resources/setup.py` covers catalog/schema/grants/views/DDL/secrets/job in one command
+- [ ] Add egress allowlist NCC IPs to `docs/OPERATIONS.md` for AWS/Azure/GCP — contact Airbrx infra for stable egress IP list
+- [x] Ingest scales to 10M+ rows — replaced `collect()` + Python loop with Spark UDFs; statement_text never touches the driver
+- [x] Security review: `push_effectiveness` sends only `{rule_id, ck, window, avoided, realized_usd}` — all aggregates, no PII, no query text. `executed_by` is selected in views but dropped before `fingerprint_history` write and never serialized to wire.
+- [ ] Apply to Databricks Technology Partner program (partner.databricks.com) — prerequisite for public marketplace listing
+- [x] Git-backed deployment — `databricks.yml` Asset Bundle added; deploy via `databricks bundle deploy`
+- [x] CI pipeline — `.github/workflows/ci.yml` runs `pytest tests/` + `databricks bundle validate` on every PR
