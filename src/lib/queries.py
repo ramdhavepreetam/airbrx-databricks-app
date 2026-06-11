@@ -1,51 +1,41 @@
 """
-Core SQL queries (§5). All use the shared views from airbrx_shared.system_views.
+Core SQL queries (§5).
 
 Key schema facts (verified against live workspace):
-  billing_usage.usage_metadata  — JSON string; extract warehouse_id with get_json_object
-  query_history.compute         — JSON string; extract warehouse_id with get_json_object
-  No list_prices view available — cost = usage_quantity (DBUs) * {dbu_rate_usd} (env var)
+  billing_usage_v: columns are d (DATE), sku_name, warehouse_id (STRING), usage_quantity,
+                   usage_start_time, usage_end_time, billing_origin_product
+  query_history_v: columns are statement_id, executed_by, warehouse_id, statement_type,
+                   execution_status, total_duration_ms, read_bytes, start_time, end_time,
+                   statement_text
 """
 
-# SP reads from these views in airbrx_app.state (which it owns).
-# Those views in turn read from airbrx_shared — keeping data inside the workspace.
-BILLING_VIEW = "airbrx_app.state.billing_usage_v"
+BILLING_VIEW       = "airbrx_app.state.billing_usage_v"
 QUERY_HISTORY_VIEW = "airbrx_app.state.query_history_v"
 
 # §5a — priced usage by warehouse and day
 # dbu_rate_usd: passed at runtime from DBU_RATE_USD env var (default $0.70/DBU)
 PRICED_USAGE = """
-WITH priced AS (
-  SELECT
-    CAST(usage_date AS DATE)                                          AS d,
-    sku_name,
-    usage_metadata.warehouse_id                 AS warehouse_id,
-    CAST(usage_quantity AS DOUBLE)                                    AS dbus,
-    CAST(usage_quantity AS DOUBLE) * {dbu_rate_usd}                   AS usd
-  FROM {billing_view}
-  WHERE CAST(usage_date AS DATE) >= date_sub(current_date(), {lookback_days})
-    AND usage_metadata.warehouse_id IS NOT NULL
-)
-SELECT d, sku_name, warehouse_id, SUM(dbus) AS dbus, SUM(usd) AS usd
-FROM priced
+SELECT
+  d,
+  sku_name,
+  warehouse_id,
+  SUM(CAST(usage_quantity AS DOUBLE))                         AS dbus,
+  SUM(CAST(usage_quantity AS DOUBLE)) * {dbu_rate_usd}        AS usd
+FROM {billing_view}
+WHERE d >= date_sub(current_date(), {lookback_days})
+  AND warehouse_id IS NOT NULL
 GROUP BY ALL
 ORDER BY d
 """
 
 # §5b — per-fingerprint attributed cost (duration-share allocation)
 ATTRIBUTED_COST = """
-WITH priced AS (
-  SELECT
-    CAST(usage_date AS DATE)                                          AS d,
-    usage_metadata.warehouse_id                 AS warehouse_id,
-    CAST(usage_quantity AS DOUBLE) * {dbu_rate_usd}                   AS usd
+WITH wh_cost AS (
+  SELECT d, warehouse_id,
+         SUM(CAST(usage_quantity AS DOUBLE)) * {dbu_rate_usd} AS wh_usd
   FROM {billing_view}
-  WHERE CAST(usage_date AS DATE) >= date_sub(current_date(), {lookback_days})
-    AND usage_metadata.warehouse_id IS NOT NULL
-),
-wh_cost AS (
-  SELECT d, warehouse_id, SUM(usd) AS wh_usd
-  FROM priced
+  WHERE d >= date_sub(current_date(), {lookback_days})
+    AND warehouse_id IS NOT NULL
   GROUP BY ALL
 ),
 stmt AS (
@@ -85,13 +75,9 @@ ORDER BY d
 INCREMENTAL_HISTORY = """
 SELECT
   statement_id,
-  executed_by,
-  get_json_object(compute, '$.warehouse_id')  AS warehouse_id,
-  statement_type,
-  execution_status,
+  warehouse_id,
   CAST(total_duration_ms AS BIGINT)           AS total_duration_ms,
   CAST(start_time AS TIMESTAMP)               AS start_time,
-  CAST(end_time   AS TIMESTAMP)               AS end_time,
   statement_text
 FROM {state_catalog}.{state_schema}.query_history_v
 WHERE CAST(start_time AS TIMESTAMP) > '{checkpoint_ts}'

@@ -26,11 +26,13 @@ logger = logging.getLogger(__name__)
 
 CATALOG       = os.environ.get("AIRBRX_STATE_CATALOG",  "airbrx_app")
 SCHEMA        = os.environ.get("AIRBRX_STATE_SCHEMA",   "state")
-WAREHOUSE_ID  = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 BILLING_VIEW  = os.environ.get("AIRBRX_BILLING_VIEW",   "airbrx_app.state.billing_usage_v")
 DBU_RATE_USD  = float(os.environ.get("DBU_RATE_USD",     "0.70"))
 LOOKBACK_DAYS = 30
 INSERT_BATCH  = 500  # rows per VALUES batch
+
+# Resolved in main() after arg parsing; module-level placeholder.
+WAREHOUSE_ID: str = ""
 
 # ---------------------------------------------------------------------------
 # Inlined fingerprint — SHARED CONTRACT with the gateway (§6c)
@@ -130,7 +132,7 @@ def run_ingest(w: WorkspaceClient) -> None:
         WHERE CAST(start_time AS TIMESTAMP) > '{checkpoint_str}'
           AND execution_status = 'FINISHED'
         ORDER BY start_time
-    """, timeout="120s")
+    """, timeout="50s")
 
     logger.info("Fetched %d new rows", len(rows))
     if not rows:
@@ -197,16 +199,16 @@ def _recompute_waterfall(w: WorkspaceClient) -> None:
     exec_sql(w, f"""
         INSERT OVERWRITE {CATALOG}.{SCHEMA}.waterfall_daily
         SELECT
-          CAST(usage_date AS DATE)                                    AS d,
+          d,
           sku_name,
-          usage_metadata.warehouse_id                                 AS warehouse_id,
+          warehouse_id,
           SUM(CAST(usage_quantity AS DOUBLE))                         AS dbus,
           SUM(CAST(usage_quantity AS DOUBLE)) * {DBU_RATE_USD}        AS usd,
           'raw'                                                       AS layer,
           current_timestamp()                                         AS updated_at
         FROM {BILLING_VIEW}
-        WHERE CAST(usage_date AS DATE) >= date_sub(current_date(), {LOOKBACK_DAYS})
-          AND usage_metadata.warehouse_id IS NOT NULL
+        WHERE d >= date_sub(current_date(), {LOOKBACK_DAYS})
+          AND warehouse_id IS NOT NULL
         GROUP BY ALL
     """)
     logger.info("waterfall_daily updated")
@@ -238,11 +240,11 @@ def _recompute_rule_effectiveness(w: WorkspaceClient) -> None:
                  SUM(wc.wh_usd * (fh.total_duration_ms / NULLIF(wd.tot_ms, 0))) AS attributed_usd
           FROM {CATALOG}.{SCHEMA}.fingerprint_history fh
           JOIN (
-            SELECT d, usage_metadata.warehouse_id AS warehouse_id,
+            SELECT d, warehouse_id,
                    SUM(CAST(usage_quantity AS DOUBLE)) * {DBU_RATE_USD} AS wh_usd
             FROM {BILLING_VIEW}
-            WHERE CAST(usage_date AS DATE) >= date_sub(current_date(), {LOOKBACK_DAYS})
-              AND usage_metadata.warehouse_id IS NOT NULL
+            WHERE d >= date_sub(current_date(), {LOOKBACK_DAYS})
+              AND warehouse_id IS NOT NULL
             GROUP BY 1, 2
           ) wc ON fh.d = wc.d AND fh.warehouse_id = wc.warehouse_id
           JOIN (
@@ -363,13 +365,23 @@ def run_sync(w: WorkspaceClient) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 def main() -> None:
+    global WAREHOUSE_ID
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["ingest", "recompute", "sync", "all"],
                         default="all")
+    parser.add_argument("--warehouse-id", default=os.environ.get("DATABRICKS_WAREHOUSE_ID", ""),
+                        help="SQL Warehouse ID (overrides DATABRICKS_WAREHOUSE_ID env var)")
     args = parser.parse_args()
 
+    WAREHOUSE_ID = args.warehouse_id
     if not WAREHOUSE_ID:
-        raise SystemExit("DATABRICKS_WAREHOUSE_ID env var is required")
+        # Auto-discover: pick first available warehouse
+        w0 = _get_client()
+        whs = list(w0.warehouses.list())
+        if not whs:
+            raise SystemExit("No SQL warehouses found. Pass --warehouse-id or set DATABRICKS_WAREHOUSE_ID.")
+        WAREHOUSE_ID = whs[0].id
+        logger.info("Auto-discovered warehouse: %s (%s)", whs[0].name, WAREHOUSE_ID)
 
     w = _get_client()
     if args.mode in ("ingest",    "all"): run_ingest(w)
