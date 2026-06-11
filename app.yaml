@@ -1,0 +1,36 @@
+command: ["streamlit", "run", "src/streamlit_app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+
+env:
+  - name: AIRBRX_SECRET_SCOPE
+    value: "airbrx-secrets"
+  - name: AIRBRX_SECRET_KEY
+    value: "api-key"
+  - name: AIRBRX_API_URL
+    value: "https://api.airbrx.ai"
+  - name: AIRBRX_STATE_CATALOG
+    value: "airbrx_app"
+  - name: AIRBRX_STATE_SCHEMA
+    value: "state"
+  - name: AIRBRX_BILLING_VIEW
+    value: "airbrx_app.state.billing_usage_v"
+  - name: DBU_RATE_USD
+    value: "0.70"
+
+# Resources grant the app's OAuth token the SQL and secret scopes it needs.
+# Without these, spark.sql() and secrets.get_secret() will return 403.
+resources:
+  - name: "sql-warehouse"
+    description: "SQL warehouse for running analysis queries"
+    sql_warehouse:
+      id: "771ee5c628aafe42"   # Serverless Starter Warehouse
+      permission: "CAN_USE"
+  - name: "airbrx-api-key"
+    description: "Airbrx API key stored in secret scope"
+    secret:
+      scope: "airbrx-secrets"
+      key: "api-key"
+      permission: "READ"
+
+# OBO (on-behalf-of-user) — Public Preview as of v1.
+# Enables the UI to read Unity Catalog data under the viewer's own permissions.
+obo_enabled: true

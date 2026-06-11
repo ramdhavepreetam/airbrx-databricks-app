@@ -1,0 +1,63 @@
+# Lakeflow (Databricks Workflows) job definition for the Airbrx analysis job.
+# Deploy via: databricks jobs create --json @resources/job.yml
+# Or import into Databricks Asset Bundles under resources/jobs/.
+
+name: airbrx-analysis
+description: "Airbrx cost-optimization analysis — hourly ingest + daily recompute"
+
+# Job-level permissions: the app SP must have CAN_MANAGE_RUN on this job
+# access_control_list:
+#   - user_name: <app-service-principal>
+#     permission_level: CAN_MANAGE_RUN
+
+tasks:
+  - task_key: hourly_ingest
+    description: "Pull new query_history rows → fingerprint_history"
+    python_script_task:
+      python_file: "src/jobs/analysis.py"
+      parameters:
+        - "--mode"
+        - "ingest"
+    existing_cluster_id: ""  # fill in: SQL warehouse or all-purpose cluster ID
+    libraries:
+      - pypi:
+          package: "databricks-sdk>=0.28.0"
+      - pypi:
+          package: "requests>=2.31.0"
+
+  - task_key: daily_recompute
+    description: "Rebuild waterfall, coverage, redundancy, rule_effectiveness"
+    depends_on:
+      - task_key: hourly_ingest
+    python_script_task:
+      python_file: "src/jobs/analysis.py"
+      parameters:
+        - "--mode"
+        - "recompute"
+    existing_cluster_id: ""  # same cluster as above
+
+  - task_key: api_sync
+    description: "Pull rules from api.airbrx.ai; push aggregate effectiveness stats"
+    depends_on:
+      - task_key: daily_recompute
+    python_script_task:
+      python_file: "src/jobs/analysis.py"
+      parameters:
+        - "--mode"
+        - "sync"
+    existing_cluster_id: ""
+
+# Hourly trigger — daily_recompute and api_sync run via task dependency after ingest
+# For daily-only tasks, add a separate job or use task-level schedules in DABs
+trigger:
+  periodic:
+    interval: 1
+    unit: HOURS
+
+# Environment variables (non-secret)
+job_env:
+  AIRBRX_STATE_CATALOG: "airbrx_app"
+  AIRBRX_STATE_SCHEMA: "state"
+  AIRBRX_SECRET_SCOPE: "airbrx-secrets"
+  AIRBRX_SECRET_KEY: "api-key"
+  AIRBRX_API_URL: "https://api.airbrx.ai"
